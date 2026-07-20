@@ -6,6 +6,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from app.agent import NewsAgent
+from app.fetchers import close_rss_session
 
 # Load .env (e.g. TWITTER_AUTH_TOKEN / TWITTER_CT0 for X auth, OPENROUTER_API_KEY
 # for the summarizer) BEFORE anything prints, so subprocess CLIs and the OpenAI
@@ -61,7 +62,11 @@ _install_utf8_streams()
 
 async def main():
     agent = NewsAgent()
-    await agent.start()
+    try:
+        await agent.start()
+    finally:
+        # Release the shared RSS aiohttp session so it isn't left open.
+        await close_rss_session()
 
 
 if __name__ == "__main__":

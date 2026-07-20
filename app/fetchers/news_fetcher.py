@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import re
@@ -12,9 +13,67 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import List, Optional
 
+import aiohttp
 import feedparser
 
 from app.models import NewsArticle
+
+# A single long-lived aiohttp session is reused across every RSS fetch instead
+# of opening a fresh connection per feed per call. It is created lazily and is
+# guarded by the event loop it was bound to: if the loop changes (e.g. a new
+# asyncio.run in tests), the stale session is discarded and a new one is made.
+_RSS_TIMEOUT = aiohttp.ClientTimeout(total=15)
+_RSS_HEADERS = {"User-Agent": f"news-agent/1.1 (+feedparser {feedparser.__version__})"}
+_session: Optional[aiohttp.ClientSession] = None
+_session_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _get_rss_session() -> aiohttp.ClientSession:
+    """Return a process-wide aiohttp session bound to the running loop.
+
+    Reusing one session keeps the TCP/TLS connection pool warm across RSS
+    fetches (no per-feed handshake). Rebinding on loop change keeps it safe
+    for repeated ``asyncio.run`` entry points and tests.
+    """
+    global _session, _session_loop
+    loop = asyncio.get_running_loop()
+    if _session is None or _session.closed or _session_loop is not loop:
+        _session = aiohttp.ClientSession(timeout=_RSS_TIMEOUT, headers=_RSS_HEADERS)
+        _session_loop = loop
+    return _session
+
+
+async def close_rss_session() -> None:
+    """Release the shared RSS session (if any) so it isn't left open.
+
+    Call once on application shutdown. Safe to call when no session exists.
+    """
+    global _session, _session_loop
+    if _session is not None and not _session.closed:
+        await _session.close()
+    _session = None
+    _session_loop = None
+
+
+@functools.lru_cache(maxsize=256)
+def _resolve(name: str) -> Optional[str]:
+    """Locate an executable, memoized so repeated fetches don't re-scan PATH.
+
+    ``shutil.which`` is called once per tool per process; lru_cache also makes
+    it pure (no ``self`` reference) so it can be reused from module scope.
+    """
+    exe = shutil.which(name)
+    if exe:
+        return exe
+    # Fall back to the project venv's Scripts dir (covers the case where
+    # the venv isn't "activated" but python is run from it).
+    for cand in (
+        Path(sys.prefix) / "Scripts" / name,
+        Path(sys.prefix) / "Scripts" / f"{name}.exe",
+    ):
+        if cand.exists():
+            return str(cand)
+    return None
 
 
 class NewsFetcher:
@@ -81,7 +140,7 @@ class NewsFetcher:
     # subprocess helper
     # ------------------------------------------------------------------ #
     async def _run_cli(self, args: List[str], timeout: float = 60.0) -> str:
-        exe = self._resolve(args[0])
+        exe = _resolve(args[0])
         if not exe:
             raise FileNotFoundError(f"{args[0]} not found on PATH")
         rest = args[1:]
@@ -106,21 +165,6 @@ class NewsFetcher:
                 f"{args[0]} exited {proc.returncode}: {err.decode(errors='replace')[:300]}"
             )
         return out.decode(errors="replace")
-
-    @staticmethod
-    def _resolve(name: str) -> Optional[str]:
-        exe = shutil.which(name)
-        if exe:
-            return exe
-        # Fall back to the project venv's Scripts dir (covers the case where
-        # the venv isn't "activated" but python is run from it).
-        for cand in (
-            Path(sys.prefix) / "Scripts" / name,
-            Path(sys.prefix) / "Scripts" / f"{name}.exe",
-        ):
-            if cand.exists():
-                return str(cand)
-        return None
 
     # ------------------------------------------------------------------ #
     # field helpers
@@ -206,13 +250,23 @@ class NewsFetcher:
         return out
 
     # ------------------------------------------------------------------ #
-    # RSS  (in-process feedparser, keyless)
+    # RSS  (in-process feedparser, keyless, fully concurrent)
     # ------------------------------------------------------------------ #
     async def _fetch_rss(self) -> List[NewsArticle]:
-        articles: List[NewsArticle] = []
         try:
-            for feed_url in self.rss_feeds:
-                feed = await asyncio.to_thread(feedparser.parse, feed_url)
+            articles: List[NewsArticle] = []
+
+            async def _fetch_one(feed_url: str) -> List[NewsArticle]:
+                # Pull bytes over the shared session, then parse in a worker
+                # thread (feedparser is blocking) — no blocking socket I/O on
+                # the event loop, and all feeds run concurrently instead of
+                # sequentially.
+                session = _get_rss_session()
+                async with session.get(feed_url) as resp:
+                    raw = await resp.read()
+                feed = await asyncio.to_thread(feedparser.parse, raw)
+                source = feed.feed.get("title", "RSS")
+                out: List[NewsArticle] = []
                 for entry in feed.entries:
                     url = entry.get("link")
                     if not url:
@@ -221,12 +275,20 @@ class NewsFetcher:
                         url,
                         entry.get("title"),
                         entry.get("summary"),
-                        feed.feed.get("title", "RSS"),
+                        source,
                         entry.get("author"),
                         entry.get("published"),
                     )
                     if a:
-                        articles.append(a)
+                        out.append(a)
+                return out
+
+            for batch in await asyncio.gather(
+                *(_fetch_one(u) for u in self.rss_feeds), return_exceptions=True
+            ):
+                if isinstance(batch, Exception):
+                    continue
+                articles.extend(batch)
             self.status["rss"] = f"ok ({len(articles)})"
         except Exception as e:
             self.status["rss"] = f"error: {e}"

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
+from enum import Enum
 from typing import List, Optional
 
 from app.agents import NewsSummarizer
-from app.briefing import MorningBriefing, present_streaming
+from app.briefing import MorningBriefing, present_streaming, SPEAK_THRESHOLD
 from app.conversation import (
     AI_NEWS,
     BUSINESS_NEWS,
@@ -24,6 +26,7 @@ from app.conversation import (
     WORLD_NEWS,
 )
 from app.fetchers import NewsFetcher
+from app.memory import CacheEntry, NewsCache
 from app.models import NewsArticle
 from app.processors import NewsProcessor
 from app.voice import SpeechRecognizer, VoiceAgent, get_tts_engine
@@ -44,12 +47,45 @@ _QUERY_FOR = {
 }
 
 
+class AgentState(Enum):
+    """The three observable states of the assistant, each logged on entry.
+
+    SLEEPING  - waiting only for the wake word; normal voice commands ignored.
+    LISTENING - inside a conversation session, accepting and routing commands.
+    SPEAKING  - producing audio; the microphone stays idle until it finishes.
+    """
+
+    SLEEPING = "sleeping"
+    LISTENING = "listening"
+    SPEAKING = "speaking"
+
+
+# Sleep commands are session-lifecycle events handled by the state machine,
+# not by the news-content intent router (which stays purely about news).
+_SLEEP_RE = re.compile(
+    r"\b(sleep mode|go to sleep|good night|stop listening|sleep)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_sleep_command(text: Optional[str]) -> bool:
+    """Return True if ``text`` is a request to enter Sleep Mode."""
+    return bool(text) and bool(_SLEEP_RE.search(text))
+
+
 class NewsAgent:
     """The brain / top-level entry point for the news application.
 
-    Owns every long-lived component and orchestrates the wake-word lifetime:
-    idle (listen for "JARVIS") -> wake -> conversation session -> idle again.
-    The microphone stays idle while a response is being spoken.
+    Owns every long-lived component and orchestrates the assistant's lifecycle
+    as a small state machine:
+
+        SLEEPING  -> (wake word "JARVIS")      -> LISTENING
+        LISTENING -> (speak)                    -> SPEAKING -> LISTENING
+        LISTENING -> (Stop / Sleep / idle)      -> SLEEPING
+
+    The microphone only listens for commands while LISTENING; in SLEEPING it
+    waits solely for the wake word and ignores everything else. Speech is
+    produced only while SPEAKING, and the mic stays idle during it.
     """
 
     def __init__(
@@ -58,6 +94,7 @@ class NewsAgent:
         top_n: int = 5,
         max_per_source: int = 5,
         session_timeout: float = 25.0,
+        cache_ttl: float = 300.0,
     ):
         self.query = query
         self.top_n = top_n
@@ -70,20 +107,46 @@ class NewsAgent:
         self.wakeword: WakeWordDetector = get_wakeword_detector()
         self._last_articles: List[NewsArticle] = []
         self._last_spoken: str = ""
+        # Short-term news memory: within the TTL, repeated commands reuse the
+        # already fetched/processed/summarized result instead of refetching.
+        self.cache = NewsCache(ttl_seconds=cache_ttl)
+        # Fresh pipeline components per call keep the fetcher/summarizer stateless
+        # across queries (status dicts don't leak); overridable for tests.
+        self._make_fetcher = lambda q: NewsFetcher(
+            query=q, max_per_source=self.max_per_source
+        )
+        self._make_processor = NewsProcessor
+        self._make_summarizer = NewsSummarizer
         # Set within a session to end it (Stop, or idle timeout) and return
         # to wake-word listening. NOT a process exit.
         self._shutdown = asyncio.Event()
+        # Explicit lifecycle state (see AgentState). Drives idle behavior and
+        # guards against accidental or duplicate wake / transition events.
+        self.state = AgentState.SLEEPING
+
+    def _set_state(self, new: "AgentState") -> None:
+        """Transition to ``new`` state, logging only on an actual change."""
+        if new is self.state:
+            return
+        prev = self.state
+        self.state = new
+        print(f"[state] {prev.value} -> {new.value}")
 
     async def start(self) -> None:
         self.voice = VoiceAgent(get_tts_engine(), top_n=self.top_n)
         self.briefing = MorningBriefing(self.voice, query=self.query, top_n=self.top_n)
 
         # 1) Morning Brief at startup (the news pipeline is unchanged).
+        self._set_state(AgentState.SPEAKING)
         self._last_articles = await self.briefing.run()
 
-        # 2) Wake-word lifetime: idle -> session -> idle ...
+        # 2) Wake-word lifetime, modelled as a clean state machine:
+        #    SLEEPING -> (wake) -> LISTENING -> (stop/sleep/timeout) -> SLEEPING.
+        #    The microphone only listens for commands while LISTENING; in
+        #    SLEEPING it waits solely for the wake word and ignores commands.
         while True:
-            print("[JARVIS] Listening for wake word...")
+            self._set_state(AgentState.SLEEPING)
+            print("[JARVIS] Sleeping - waiting for wake word 'JARVIS'...")
             try:
                 await self.wakeword.wait_for_wake()
             except Exception as e:
@@ -92,18 +155,16 @@ class NewsAgent:
                 print(f"[wakeword] detection failed: {e}")
                 await asyncio.sleep(2.0)
                 continue
-            try:
-                self.voice.speak("Yes?")  # short acknowledgment
-            except Exception as e:
-                print(f"[voice] acknowledgment failed: {e}")
+            await self._wake()
             await self._run_session()
 
     async def _run_session(self) -> None:
         self._shutdown.clear()
+        self._set_state(AgentState.LISTENING)
         print("[JARVIS] Listening...")
         last_speech = time.monotonic()
         # One conversation session: listen -> route -> speak -> listen again,
-        # until the user says Stop or goes quiet for session_timeout seconds.
+        # until the user says Stop / Sleep or goes quiet for session_timeout.
         while not self._shutdown.is_set():
             try:
                 text = await self.stt.listen()  # mic idle until now
@@ -112,13 +173,52 @@ class NewsAgent:
                 text = ""
             if not text:
                 if time.monotonic() - last_speech > self.session_timeout:
-                    self.voice.speak("Going back to sleep.")
+                    # Idle too long: go back to sleep.
+                    self._shutdown.set()
+                    await self._respond("Going back to sleep.")
+                    self._set_state(AgentState.SLEEPING)
                     return
                 continue
             last_speech = time.monotonic()
             print(f"[you] {text}")
+            # Sleep is a session-lifecycle command handled by the state machine,
+            # not the content intent router.
+            if _is_sleep_command(text):
+                await self._sleep()
+                return
             intent = await self.conversation.handle(text)
             await self._route(intent)
+
+    # ------------------------------------------------------------------ #
+    # wake / sleep lifecycle
+    # ------------------------------------------------------------------ #
+    async def _wake(self) -> None:
+        """Wake from SLEEPING into a listening session.
+
+        Guarded so a stray/duplicate wake event (e.g. the detector firing
+        twice) can never start a second session while one is already live.
+        """
+        if self.state is not AgentState.SLEEPING:
+            return
+        self._set_state(AgentState.SPEAKING)  # short acknowledgment
+        try:
+            self.voice.speak("Yes?")
+        except Exception as e:
+            print(f"[voice] wake acknowledgment failed: {e}")
+        self._set_state(AgentState.LISTENING)
+        print("[JARVIS] Listening...")
+
+    async def _sleep(self) -> None:
+        """Enter Sleep Mode: confirm, then stop accepting commands.
+
+        Sets the session-shutdown event first so the speaking state is not
+        reset to LISTENING by ``_respond``; the loop then returns to the
+        wake-word wait without terminating the process.
+        """
+        self._shutdown.set()
+        await self._respond("Going to sleep.")
+        self._set_state(AgentState.SLEEPING)
+        print("[JARVIS] Sleeping - voice commands paused.")
 
     # ------------------------------------------------------------------ #
     # routing
@@ -127,8 +227,9 @@ class NewsAgent:
         name = intent.name
         if name == STOP:
             # End this session and return to wake-word listening.
-            await self._respond("Goodbye for now.")
             self._shutdown.set()
+            await self._respond("Goodbye for now.")
+            self._set_state(AgentState.SLEEPING)
             return
         if name == REPEAT:
             if self._last_spoken:
@@ -137,7 +238,10 @@ class NewsAgent:
                 await self._respond("I haven't said anything yet.")
             return
         if name == MORNING_BRIEF:
+            self._set_state(AgentState.SPEAKING)
             self._last_articles = await self.briefing.run()
+            if not self._shutdown.is_set():
+                self._set_state(AgentState.LISTENING)
             return
         if name == EXPLAIN_ARTICLE:
             await self._explain(intent)
@@ -155,21 +259,117 @@ class NewsAgent:
     # actions
     # ------------------------------------------------------------------ #
     async def _fetch_and_speak(self, query: str) -> List[NewsArticle]:
-        fetcher = NewsFetcher(query=query, max_per_source=self.max_per_source)
+        """Fetch (or serve from cache) news for ``query`` and speak it.
+
+        * Fresh cache hit -> replay the cached stories instantly, no I/O.
+        * Stale cache hit -> replay cached stories instantly AND kick off a
+          single background refresh that repopulates the cache when done.
+        * Cold miss       -> stream (instant first word) and populate the cache.
+
+        The streaming pipeline (``present_streaming``) itself is untouched;
+        the cache only decides whether to run it at all.
+        """
+        self._set_state(AgentState.SPEAKING)
+        result: List[NewsArticle]
+        async with self.cache.lock(query):
+            entry = self.cache.get(query)
+            if entry is None:
+                mode, start_refresh = "cold", False
+            elif self.cache.is_fresh(entry):
+                mode, start_refresh = "warm", False
+            else:
+                mode, start_refresh = "stale", not entry.refreshing
+                if start_refresh:
+                    entry.refreshing = True  # serialized by the lock
+        # Decision made under the per-key lock; act without holding it.
+        if mode == "cold":
+            self.cache.misses += 1
+            result = await self._pipeline_and_speak(query)
+            self.cache.put(query, result)
+        else:
+            # Warm or stale-serving: replay the cache immediately.
+            self.cache.hits += 1
+            await self._speak_cached(entry)
+            self._last_articles = entry.articles
+            result = entry.articles
+            if start_refresh:
+                # Fire-and-forget; the user never waits for the refresh.
+                asyncio.ensure_future(self._refresh(query))
+        if not self._shutdown.is_set():
+            self._set_state(AgentState.LISTENING)
+        return result
+
+    async def _pipeline_and_speak(self, query: str) -> List[NewsArticle]:
+        """Cold path: stream the news (instant first word) and return it ranked."""
+        fetcher = self._make_fetcher(query)
         intro = [f"Here are the top {self.top_n} {query} stories."]
         # Stream: speak the intro instantly, then read high-priority stories as
         # their source finishes while the rest keep fetching in the background.
         articles, spoken = await present_streaming(
             fetcher,
-            NewsProcessor(),
-            NewsSummarizer(),
+            self._make_processor(),
+            self._make_summarizer(),
             self.voice,
             self.top_n,
             intro,
             lambda n: [],
         )
         self._last_spoken = spoken
-        return articles
+        # Store the canonical ranked list (deduped + sorted) so cache replay
+        # and "explain" see the same ordering the user heard.
+        return self._make_processor().process(articles)
+
+    async def _pipeline_silent(self, query: str) -> List[NewsArticle]:
+        """Background refresh path: build the ranked, summarized list, no speech."""
+        fetcher = self._make_fetcher(query)
+        processor = self._make_processor()
+        summarizer = self._make_summarizer()
+        running: List[NewsArticle] = []
+        summarized: set = set()
+        async for batch in fetcher.fetch_stream():
+            running.extend(batch)
+            processed = processor.process(running)
+            targets = [
+                a for a in processed
+                if a.importance_score >= SPEAK_THRESHOLD and a.id not in summarized
+            ]
+            if targets:
+                await summarizer.summarize(targets)
+                summarized.update(a.id for a in targets)
+        # Atomic replace happens in NewsCache.put (called by _refresh).
+        return processor.process(running)
+
+    async def _speak_cached(self, entry: CacheEntry) -> None:
+        """Replay a cached result immediately (data is already fully ready)."""
+        loop = asyncio.get_event_loop()
+        spoken: List[str] = []
+
+        async def say(line: str) -> None:
+            print(f"[agent] {line}")
+            await loop.run_in_executor(None, self.voice.speak, line)
+            spoken.append(line)
+
+        await say(f"Here are the top {self.top_n} {entry.query} stories.")
+        for i, a in enumerate(entry.articles[: self.top_n], 1):
+            await say(VoiceAgent._to_speech(a, i))
+        self._last_spoken = " ".join(spoken)
+
+    async def _refresh(self, query: str) -> None:
+        """Repopulate a stale cache entry in the background; never blocks a user."""
+        try:
+            articles = await self._pipeline_silent(query)
+        except Exception as e:
+            # Leave the previous (stale) entry in place so a later request
+            # can still be served, and let the next staleness retry refresh.
+            print(f"[cache] background refresh failed for {query!r}: {e}")
+            async with self.cache.lock(query):
+                entry = self.cache.get(query)
+                if entry is not None:
+                    entry.refreshing = False
+            return
+        # Entirely new list built before this swap; readers never see a
+        # partially updated cache.
+        self.cache.put(query, articles)
 
     async def _explain(self, intent) -> None:
         arts = self._last_articles
@@ -214,6 +414,7 @@ class NewsAgent:
         return 0
 
     async def _respond(self, *lines: str) -> None:
+        self._set_state(AgentState.SPEAKING)
         text = " ".join(lines)
         for line in lines:
             print(f"[agent] {line}")
@@ -221,3 +422,7 @@ class NewsAgent:
             # Speak off the event loop so the mic stays idle until done.
             await loop.run_in_executor(None, self.voice.speak, line)
         self._last_spoken = text
+        # Stay in SPEAKING only if the session is ending (shutdown set);
+        # otherwise we're back to listening for the next command.
+        if not self._shutdown.is_set():
+            self._set_state(AgentState.LISTENING)
