@@ -167,10 +167,15 @@ class MorningBriefing:
         fetcher_factory: Optional[Callable[[str], NewsFetcher]] = None,
         processor: Optional[NewsProcessor] = None,
         summarizer: Optional[NewsSummarizer] = None,
+        ordered_queries: Optional[List[str]] = None,
     ):
         self.voice = voice_agent
         self.query = query
         self.top_n = top_n
+        # Personalization: the ordered list of category queries to present.
+        # Preferred categories come first, then the default. When None, the
+        # single ``query`` is used (original behavior).
+        self.ordered_queries = ordered_queries
         self._make_fetcher = fetcher_factory or (
             lambda q: NewsFetcher(query=q, max_per_source=5)
         )
@@ -178,7 +183,7 @@ class MorningBriefing:
         self._summarizer = summarizer or NewsSummarizer()
 
     async def run(self) -> List[NewsArticle]:
-        fetcher = self._make_fetcher(self.query)
+        ordered = self.ordered_queries or [self.query]
         now = datetime.now()
         greeting = (
             f"{_greeting(now)}! It's {now.strftime('%A')}, "
@@ -186,16 +191,30 @@ class MorningBriefing:
             f"{now.strftime('%Y')}, and the time is {_time_phrase(now)}."
         )
 
-        def completion(count: int) -> List[str]:
-            return [_analyzed_line(count), _CLOSING]
+        all_articles: List[NewsArticle] = []
+        seen: set = set()
+        for i, q in enumerate(ordered):
+            fetcher = self._make_fetcher(q)
+            # Greeting is spoken once (first category); later categories just
+            # continue the briefing without repeating it.
+            intro = [greeting] if i == 0 else []
+            is_last = i == len(ordered) - 1
 
-        articles, _ = await present_streaming(
-            fetcher,
-            self._processor,
-            self._summarizer,
-            self.voice,
-            self.top_n,
-            [greeting],
-            completion,
-        )
-        return articles
+            def completion(count: int, _last: bool = is_last) -> List[str]:
+                # Closing line only after the final category.
+                return [_analyzed_line(count), _CLOSING] if _last else []
+
+            arts, _ = await present_streaming(
+                fetcher,
+                self._processor,
+                self._summarizer,
+                self.voice,
+                self.top_n,
+                intro,
+                completion,
+            )
+            for a in arts:
+                if a.id not in seen:
+                    seen.add(a.id)
+                    all_articles.append(a)
+        return all_articles

@@ -34,6 +34,18 @@ from app.conversation import (
 from app.fetchers import NewsFetcher
 from app.memory import CacheEntry, NewsCache
 from app.models import NewsArticle
+from app.preferences import (
+    FORGET_PREFS,
+    RECALL_PREFS,
+    REMEMBER_CATEGORY,
+    SET_NUM_STORIES,
+    SET_SUMMARIES,
+    PreferenceIntent,
+    PreferenceRecognizer,
+    UserPreferences,
+    default_prefs_path,
+    load_preferences,
+)
 from app.processors import NewsProcessor
 from app.voice import SpeechRecognizer, VoiceAgent, get_tts_engine
 from app.wakeword import WakeWordDetector, get_wakeword_detector
@@ -137,6 +149,21 @@ def _pick(lines: List[str]) -> str:
     return random.choice(lines)
 
 
+class _NullSummarizer:
+    """No-op stand-in used when the user turns AI summaries off.
+
+    Stories keep their raw feed ``summary`` but receive no LLM enrichment
+    (one_line_summary / why_it_matters / possible_impact). Has the same duck
+    type as ``NewsSummarizer`` (``summarize`` coroutine + ``status``) so the
+    streaming pipeline is untouched.
+    """
+
+    status = "disabled"
+
+    async def summarize(self, articles) -> None:
+        return None
+
+
 class NewsAgent:
     """The brain / top-level entry point for the news application.
 
@@ -161,12 +188,17 @@ class NewsAgent:
         cache_ttl: float = 300.0,
     ):
         self.query = query
-        self.top_n = top_n
         self.max_per_source = max_per_source
         self.session_timeout = session_timeout
+        # Long-term user preferences: loaded from JSON on start (defaults if
+        # the file is missing/corrupt) and the source of truth for top_n.
+        self.prefs_path = default_prefs_path()
+        self.preferences: UserPreferences = load_preferences(self.prefs_path)
+        self.top_n = self.preferences.num_stories
         self.voice: Optional[VoiceAgent] = None
         self.briefing: Optional[MorningBriefing] = None
         self.conversation = ConversationManager()
+        self.preferences_recognizer = PreferenceRecognizer()
         self.stt = SpeechRecognizer()
         self.wakeword: WakeWordDetector = get_wakeword_detector()
         self._last_articles: List[NewsArticle] = []
@@ -180,7 +212,9 @@ class NewsAgent:
             query=q, max_per_source=self.max_per_source
         )
         self._make_processor = NewsProcessor
-        self._make_summarizer = NewsSummarizer
+        # Summarizer is chosen per call so a runtime toggle of AI summaries
+        # (preferences.ai_summaries) takes effect on the next fetch.
+        self._make_summarizer = self._build_summarizer
         # Set within a session to end it (Stop, or idle timeout) and return
         # to wake-word listening. NOT a process exit.
         self._shutdown = asyncio.Event()
@@ -216,9 +250,23 @@ class NewsAgent:
         self.context.selected_index = 0
         self.context.last_response = self._last_spoken
 
+    def _build_summarizer(self):
+        """Pick the summarizer for the current AI-summaries preference.
+
+        Returns the real ``NewsSummarizer`` when enabled, else a no-op that
+        leaves stories un-enriched (raw feed summary only).
+        """
+        return NewsSummarizer() if self.preferences.ai_summaries else _NullSummarizer()
+
     async def start(self) -> None:
         self.voice = VoiceAgent(get_tts_engine(), top_n=self.top_n)
-        self.briefing = MorningBriefing(self.voice, query=self.query, top_n=self.top_n)
+        self.briefing = MorningBriefing(
+            self.voice,
+            query=self.query,
+            top_n=self.top_n,
+            ordered_queries=self.preferences.briefing_queries(self.query),
+            summarizer=self._build_summarizer(),
+        )
 
         # 1) Morning Brief at startup (the news pipeline is unchanged).
         self._set_state(AgentState.SPEAKING)
@@ -272,6 +320,14 @@ class NewsAgent:
             if _is_sleep_command(text):
                 await self._sleep()
                 return
+            # Personalization layer: preference commands ("remember I like AI
+            # news", "read only three stories", ...) are handled before the
+            # conversation router so they never collide with category/news
+            # intents. Returns None for ordinary news commands.
+            pintent = self.preferences_recognizer.recognize(text)
+            if pintent is not None:
+                await self._route_preference(pintent)
+                continue
             intent = await self.conversation.handle(text)
             await self._route(intent)
 
@@ -328,6 +384,12 @@ class NewsAgent:
             return
         if name == MORNING_BRIEF:
             self._set_state(AgentState.SPEAKING)
+            # Recompute the personalized order + summarizer + story count in
+            # case prefs changed mid-session (e.g. AI summaries toggled off,
+            # or "read only three stories" changed the count).
+            self.briefing.ordered_queries = self.preferences.briefing_queries(self.query)
+            self.briefing.top_n = self.top_n
+            self.briefing._summarizer = self._build_summarizer()
             self._last_articles = await self.briefing.run()
             self._set_context("morning brief", self._last_articles)
             if not self._shutdown.is_set():
@@ -354,6 +416,60 @@ class NewsAgent:
             self._set_context(_QUERY_FOR[name], self._last_articles)
             return
         # Unknown / fallback: a brief, natural nudge (no long menu read-out).
+        await self._respond(_pick(_ERROR_LINES))
+
+    # ------------------------------------------------------------------ #
+    # preference routing (personalization layer)
+    # ------------------------------------------------------------------ #
+    async def _route_preference(self, pintent: PreferenceIntent) -> None:
+        """Act on a personalization intent and persist any change to disk."""
+        name = pintent.name
+        if name == FORGET_PREFS:
+            self.preferences.reset()
+            self.preferences.save(self.prefs_path)
+            self.top_n = self.preferences.num_stories
+            if self.voice is not None:
+                self.voice.top_n = self.top_n
+            await self._respond("Forgotten. I'm not keeping any preferences for you.")
+            return
+        if name == RECALL_PREFS:
+            if not self.preferences.loaded and not self.preferences.categories:
+                await self._respond("I don't have any preferences saved for you yet.")
+            else:
+                await self._respond(self.preferences.describe())
+            return
+        if name == SET_SUMMARIES:
+            self.preferences.ai_summaries = bool(pintent.on)
+            self.preferences.save(self.prefs_path)
+            await self._respond(
+                "AI summaries on." if self.preferences.ai_summaries else "AI summaries off."
+            )
+            return
+        if name == SET_NUM_STORIES:
+            n = max(1, min(20, int(pintent.value)))
+            self.preferences.num_stories = n
+            self.preferences.save(self.prefs_path)
+            self.top_n = n
+            if self.voice is not None:
+                self.voice.top_n = n
+            await self._respond(f"Got it - I'll read {n} stories at a time.")
+            return
+        if name == REMEMBER_CATEGORY:
+            cat = pintent.category
+            if pintent.first:
+                # Move the category to the front of the preferred order.
+                self.preferences.categories = [cat] + [
+                    c for c in self.preferences.categories if c != cat
+                ]
+                ack = f"Okay, I'll put {cat} first in your briefing."
+            else:
+                if cat not in self.preferences.categories:
+                    self.preferences.categories.append(cat)
+                ack = f"Got it - I'll remember you like {cat} news."
+            self.preferences.save(self.prefs_path)
+            await self._respond(ack)
+            return
+        # Defensive: an unrecognized preference intent should never reach here.
         await self._respond(_pick(_ERROR_LINES))
 
     # ------------------------------------------------------------------ #

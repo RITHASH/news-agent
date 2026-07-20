@@ -65,5 +65,11 @@ vosk-model-*
 # --- Claude Code local settings (may contain machine-specific config) ---
 .claude/settings.local.json
 
+# --- Claude Code local state / memory (machine-specific; not project code) ---
+.claude/
+
+# --- Local user preferences (written at runtime by the preferences layer) ---
+config/user_preferences.json
+
 # --- Generated audio ---
 *.wav

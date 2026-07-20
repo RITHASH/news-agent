@@ -30,6 +30,16 @@ matters, and possible impact. Speech synthesis (Kokoro), speech recognition
   fallback.
 - **Rule-based conversation router** — fast, predictable intent matching (no LLM
   in the hot path).
+- **Conversation context & follow-ups** — within a session, JARVIS remembers the
+  current category and the stories it just read, so you can say *"next"*,
+  *"previous"*, *"first / second / third story"*, *"tell me more"*, *"repeat"*,
+  or *"explain the first story"* without re-fetching.
+- **Long-term user preferences** — tell JARVIS what you like and it remembers
+  across restarts, persisted to a local JSON file (no cloud). Set preferred
+  categories (*"remember I like AI news"*, *"put technology first"*), the number
+  of stories (*"read only three stories"*), and whether to use AI summaries
+  (*"turn AI summaries off"*); ask *"what do you remember about me?"*, or
+  *"forget my preferences"* to reset.
 - **Pluggable engines** — swap TTS / wake-word engines by dropping in one module
   and setting an env var.
 
@@ -43,6 +53,7 @@ main.py
        ├─ WakeWordDetector (app/wakeword)   # Vosk "jarvis" listener
        ├─ SpeechRecognizer (app/voice/stt)  # Vosk STT (one utterance)
        ├─ ConversationManager (app/conversation)  # rule-based intent router
+       ├─ Preferences (app/preferences)     # long-term user preferences (JSON)
        ├─ MorningBriefing (app/briefing)    # builds + speaks the briefing
        │    ├─ NewsFetcher (app/fetchers)   # concurrent multi-source fetch
        │    ├─ NewsProcessor (app/processors)  # dedupe / categorize / score
@@ -147,8 +158,12 @@ You'll see a morning briefing printed and spoken, then:
 Say **"Jarvis"**, then try:
 
 - *"latest news"*, *"technology news"*, *"startup news"*, *"world news"*, *"sports news"*
-- *"tell me more about the first story"*
-- *"repeat"*
+- *"tell me more about the first story"* — or, after a briefing, just *"explain the first story"*
+- *"next"*, *"previous"*, *"first story"*, *"third one"* — move through the stories already read
+- *"tell me more"* — expand the story you're currently on
+- *"repeat"* — hear the last thing JARVIS said again
+- *"remember that I like AI news"*, *"read only three stories"*, *"turn AI summaries off"*
+- *"what do you remember about me?"*, *"forget my preferences"*
 - *"stop"* (ends the session, returns to wake-word listening)
 
 ---
@@ -178,12 +193,13 @@ news-agent/
 │   ├── fetchers/            # NewsFetcher (multi-source, concurrent)
 │   ├── models/              # NewsArticle data model
 │   ├── processors/          # Dedupe / categorize / score
+│   ├── preferences/         # Long-term user preferences (local JSON)
 │   ├── voice/               # TTS engine, Kokoro, STT, VoiceAgent
 │   ├── wakeword/            # Vosk wake-word detector
-│   ├── api/                 # Reserved (V1.1)
-│   ├── config/              # Reserved (V1.1)
-│   ├── memory/              # Reserved (V1.1)
-│   └── utils/               # Reserved (V1.1)
+│   ├── api/                 # Reserved (future)
+│   ├── config/              # Reserved (future)
+│   ├── memory/              # Reserved (future)
+│   └── utils/               # Reserved (future)
 └── .env                     # Your secrets (git-ignored)
 ```
 
@@ -196,7 +212,10 @@ news-agent/
 - Deterministic dedup + categorization + importance scoring.
 - Optional LLM enrichment of top stories via OpenRouter.
 - Spoken morning briefing and on-demand category news.
-- "Tell me more" deep-dive on the last set of stories.
+- Session conversation context: next / previous / select-by-ordinal navigation,
+  "tell me more" deep-dives, and "repeat" — all without re-fetching.
+- Long-term user preferences: preferred categories, briefing order, stories-per-
+  briefing, and AI-summary toggle, persisted locally and reloaded on start.
 - Fully offline core pipeline (no keys required to run).
 
 ---
@@ -217,11 +236,10 @@ news-agent/
 ## Future Roadmap
 
 - Implement the reserved packages: `app/api` (HTTP API), `app/memory`
-  (conversation memory), `app/config` (settings loader), `app/utils`.
+  (persistent article store), `app/config` (settings loader), `app/utils`.
 - Additional TTS and wake-word engines behind the existing factory interfaces.
-- Persistent article store and richer "explain" follow-ups.
+- Richer "explain" follow-ups and a persistent article store.
 - Cross-platform audio setup and a lightweight web UI.
-- Streaming fetch + speak for lower latency.
 
 ---
 
