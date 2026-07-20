@@ -54,6 +54,29 @@ class NewsFetcher:
             articles.extend(r)
         return articles
 
+    async def fetch_stream(self):
+        """Yield each source's articles as soon as that source completes.
+
+        All six sources launch concurrently (identical to ``fetch``), but the
+        caller receives results incrementally instead of blocking on the
+        slowest source. This is what lets the pipeline begin speaking before
+        the last fetch finishes. Failed sources are skipped; empty batches are
+        not yielded.
+        """
+        tasks = [
+            self._fetch_rss(),
+            self._fetch_exa(),
+            self._fetch_youtube(),
+            self._fetch_x(),
+            self._fetch_reddit(),
+            self._fetch_linkedin(),
+        ]
+        for done in asyncio.as_completed(tasks):
+            batch = await done
+            if isinstance(batch, Exception) or not batch:
+                continue
+            yield batch
+
     # ------------------------------------------------------------------ #
     # subprocess helper
     # ------------------------------------------------------------------ #

@@ -5,13 +5,18 @@ import time
 from typing import List, Optional
 
 from app.agents import NewsSummarizer
-from app.briefing import MorningBriefing
+from app.briefing import MorningBriefing, present_streaming
 from app.conversation import (
+    AI_NEWS,
+    BUSINESS_NEWS,
     ConversationManager,
     EXPLAIN_ARTICLE,
+    FINANCE_NEWS,
     LATEST_NEWS,
     MORNING_BRIEF,
+    POLITICS_NEWS,
     REPEAT,
+    SCIENCE_NEWS,
     SPORTS_NEWS,
     STARTUP_NEWS,
     STOP,
@@ -31,6 +36,11 @@ _QUERY_FOR = {
     STARTUP_NEWS: "startup news",
     WORLD_NEWS: "world news",
     SPORTS_NEWS: "sports news",
+    AI_NEWS: "artificial intelligence news",
+    BUSINESS_NEWS: "business news",
+    SCIENCE_NEWS: "science news",
+    POLITICS_NEWS: "politics news",
+    FINANCE_NEWS: "finance news",
 }
 
 
@@ -146,14 +156,19 @@ class NewsAgent:
     # ------------------------------------------------------------------ #
     async def _fetch_and_speak(self, query: str) -> List[NewsArticle]:
         fetcher = NewsFetcher(query=query, max_per_source=self.max_per_source)
-        articles = await fetcher.fetch()
-        articles = NewsProcessor().process(articles)
-        await NewsSummarizer().summarize(articles)
-        top = articles[: self.top_n]
-        lines = [f"Here are the top {len(top)} {query} stories."]
-        for i, a in enumerate(top, 1):
-            lines.append(VoiceAgent._to_speech(a, i))
-        await self._respond(*lines)
+        intro = [f"Here are the top {self.top_n} {query} stories."]
+        # Stream: speak the intro instantly, then read high-priority stories as
+        # their source finishes while the rest keep fetching in the background.
+        articles, spoken = await present_streaming(
+            fetcher,
+            NewsProcessor(),
+            NewsSummarizer(),
+            self.voice,
+            self.top_n,
+            intro,
+            lambda n: [],
+        )
+        self._last_spoken = spoken
         return articles
 
     async def _explain(self, intent) -> None:

@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 from app.agents import NewsSummarizer
 from app.fetchers import NewsFetcher
 from app.models import NewsArticle
 from app.processors import NewsProcessor
 from app.voice import VoiceAgent
+
+# A story is read aloud the moment its importance score reaches this
+# threshold — no need to wait for the whole pipeline to drain. It mirrors the
+# summarizer's own min_importance so the articles we surface first are exactly
+# the ones worth hearing.
+SPEAK_THRESHOLD = 55
 
 _CLOSING = (
     "Would you like technology news, startup news, world news, "
@@ -35,6 +42,112 @@ def _greeting(now: datetime) -> str:
 
 def _time_phrase(now: datetime) -> str:
     return now.strftime("%I:%M %p").lstrip("0")
+
+
+def _analyzed_line(n: int) -> str:
+    if n == 0:
+        return "I couldn't find any news to analyze just now."
+    if n == 1:
+        return "I analyzed 1 article from across the web for you today."
+    return (
+        f"I analyzed {n} articles from across the web to find what "
+        "matters most to you today."
+    )
+
+
+async def present_streaming(
+    fetcher: NewsFetcher,
+    processor: NewsProcessor,
+    summarizer: NewsSummarizer,
+    voice: VoiceAgent,
+    top_n: int,
+    intro_lines: List[str],
+    completion_factory: Callable[[int], List[str]],
+) -> Tuple[List[NewsArticle], str]:
+    """Fetch, rank and speak with zero idle wait.
+
+    The intro is spoken immediately, then each source's articles are pulled in
+    as that source finishes: process + rank, then summarize-and-speak any
+    high-priority story right away. Speech runs in a worker thread (via the
+    event loop's executor) so the loop keeps fetching and processing the
+    remaining sources while Kokoro is talking. Once every source is done, the
+    canonical top-N (most recent) are guaranteed spoken in order, and the
+    closing lines (built from the final article count) are read.
+
+    Returns ``(all_articles, spoken_text)`` so callers can reuse the result and
+    record the last thing said (for "repeat").
+    """
+    loop = asyncio.get_running_loop()
+    running: List[NewsArticle] = []
+    spoken_ids: set = set()
+    spoken_text: List[str] = []
+    summarized_ids: set = set()
+    index = 0
+    spoken_count = 0
+
+    async def say(line: str) -> None:
+        print(f"[agent] {line}")
+        await loop.run_in_executor(None, voice.speak, line)
+        spoken_text.append(line)
+
+    async def ensure_summarized(articles: List[NewsArticle]) -> None:
+        # Enrich only the important, not-yet-summarized stories. The summarizer
+        # self-filters by importance, so we pass the exact subset we want rather
+        # than letting it re-pick a global top-N. Per call this is one source's
+        # worth of new stories, well under the summarizer's internal cap.
+        targets = [
+            a for a in articles
+            if a.id not in summarized_ids and a.importance_score >= SPEAK_THRESHOLD
+        ]
+        if not targets:
+            return
+        await summarizer.summarize(targets)
+        summarized_ids.update(a.id for a in targets)
+
+    # 1) Acknowledge instantly — the user hears a response before any fetch.
+    for line in intro_lines:
+        await say(line)
+
+    # 2) Stream sources as they finish; speak high-priority stories at once.
+    async for batch in fetcher.fetch_stream():
+        running.extend(batch)
+        processed = processor.process(running)
+        await ensure_summarized(processed)
+        for a in processed:
+            if a.id in spoken_ids or a.importance_score < SPEAK_THRESHOLD:
+                continue
+            if spoken_count >= top_n:
+                # Enough early highlights; the flush below orders the rest.
+                break
+            index += 1
+            spoken_count += 1
+            await say(VoiceAgent._to_speech(a, index))
+            spoken_ids.add(a.id)
+
+    # 3) Guarantee the canonical top-N (most recent) are all read, in order,
+    #    filling any gaps the early phase left. Capped at top_n so we never
+    #    read more than the original fixed-length briefing.
+    processed = processor.process(running)
+    await ensure_summarized(processed)
+    for a in processed[:top_n]:
+        if a.id in spoken_ids:
+            continue
+        if spoken_count >= top_n:
+            break
+        index += 1
+        spoken_count += 1
+        await say(VoiceAgent._to_speech(a, index))
+        spoken_ids.add(a.id)
+
+    # 4) Closing line(s) — built now that we know the final article count.
+    for line in completion_factory(len(processed)):
+        await say(line)
+
+    print("-" * 60)
+    print("SOURCES:", " | ".join(f"{s}:{fetcher.status.get(s, '?')}" for s in _SOURCES))
+    print("SUMMARIZER:", summarizer.status)
+
+    return running, " ".join(spoken_text)
 
 
 class MorningBriefing:
@@ -66,70 +179,23 @@ class MorningBriefing:
 
     async def run(self) -> List[NewsArticle]:
         fetcher = self._make_fetcher(self.query)
-        articles = await fetcher.fetch()
-        articles = self._processor.process(articles)
-        await self._summarizer.summarize(articles)
-        top = articles[: self.top_n]
-        self._present(articles, top, fetcher.status, self._summarizer.status)
-        return articles
-
-    # ------------------------------------------------------------------ #
-    # script
-    # ------------------------------------------------------------------ #
-    def build_script(self, articles: List[NewsArticle]) -> List[str]:
         now = datetime.now()
-        segments: List[str] = []
-        segments.append(f"{_greeting(now)}! It's {now.strftime('%A')}, "
-                        f"{now.strftime('%B')} {_ordinal(now.day)}, "
-                        f"{now.strftime('%Y')}, and the time is {_time_phrase(now)}.")
+        greeting = (
+            f"{_greeting(now)}! It's {now.strftime('%A')}, "
+            f"{now.strftime('%B')} {_ordinal(now.day)}, "
+            f"{now.strftime('%Y')}, and the time is {_time_phrase(now)}."
+        )
 
-        n = len(articles)
-        if n == 0:
-            segments.append("I couldn't find any news to analyze just now.")
-        elif n == 1:
-            segments.append("I analyzed 1 article from across the web for you today.")
-        else:
-            segments.append(
-                f"I analyzed {n} articles from across the web to find what "
-                "matters most to you today."
-            )
+        def completion(count: int) -> List[str]:
+            return [_analyzed_line(count), _CLOSING]
 
-        count = min(self.top_n, n)
-        if count == 0:
-            segments.append("There are no stories to read right now.")
-        else:
-            segments.append(f"Here are the top {count} stories.")
-            connectors = ["First", "Second", "Third", "Fourth", "Fifth", "Sixth"]
-            for i, a in enumerate(articles[:count]):
-                if i == count - 1 and count > 1:
-                    label = "Finally"
-                elif i < len(connectors):
-                    label = connectors[i]
-                else:
-                    label = f"Story {i + 1}"
-                segments.append(self._story_line(a, label))
-
-        segments.append(_CLOSING)
-        return segments
-
-    @staticmethod
-    def _story_line(article: NewsArticle, connector: str) -> str:
-        bits = [f"{connector}, {article.title}."]
-        if getattr(article, "one_line_summary", None):
-            bits.append(article.one_line_summary.rstrip(". ") + ".")
-        elif article.summary:
-            bits.append(article.summary[:240].rstrip(". ") + ".")
-        if getattr(article, "why_it_matters", None):
-            bits.append("Why it matters: " + article.why_it_matters.rstrip(". ") + ".")
-        return " ".join(bits)
-
-    # ------------------------------------------------------------------ #
-    # delivery
-    # ------------------------------------------------------------------ #
-    def _present(self, articles, top, fetcher_status, summarizer_status) -> None:
-        for seg in self.build_script(articles):
-            print(seg)
-            self.voice.speak(seg)
-        print("-" * 60)
-        print("SOURCES:", " | ".join(f"{s}:{fetcher_status.get(s, '?')}" for s in _SOURCES))
-        print("SUMMARIZER:", summarizer_status)
+        articles, _ = await present_streaming(
+            fetcher,
+            self._processor,
+            self._summarizer,
+            self.voice,
+            self.top_n,
+            [greeting],
+            completion,
+        )
+        return articles

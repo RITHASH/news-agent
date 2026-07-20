@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional, Tuple
 
 # Recognized intent names. Kept as constants so callers never string-match.
 MORNING_BRIEF = "MorningBrief"
@@ -11,6 +11,11 @@ TECHNOLOGY_NEWS = "TechnologyNews"
 STARTUP_NEWS = "StartupNews"
 WORLD_NEWS = "WorldNews"
 SPORTS_NEWS = "SportsNews"
+AI_NEWS = "AINews"
+BUSINESS_NEWS = "BusinessNews"
+SCIENCE_NEWS = "ScienceNews"
+POLITICS_NEWS = "PoliticsNews"
+FINANCE_NEWS = "FinanceNews"
 EXPLAIN_ARTICLE = "ExplainArticle"
 REPEAT = "Repeat"
 STOP = "Stop"
@@ -41,19 +46,55 @@ _STOP = ["stop", "exit", "quit", "goodbye", "bye", "that's all", "that is all", 
 # Re-state the last response.
 _REPEAT = ["repeat", "say again", "once more", "again"]
 
-# Category keyword sets -> the intent that represents them.
-_CATEGORY_KEYWORDS = {
-    "technology": ["technology", "tech", "software", "ai", "artificial intelligence", "gadget", "computing"],
-    "startup": ["startup", "startups", "venture", "funding", "entrepreneur"],
-    "world": ["world", "global", "international", "foreign"],
-    "sports": ["sport", "sports", "football", "soccer", "basketball", "nba", "cricket", "match", "game"],
-}
-_CATEGORY_INTENT = {
-    "technology": TECHNOLOGY_NEWS,
-    "startup": STARTUP_NEWS,
-    "world": WORLD_NEWS,
-    "sports": SPORTS_NEWS,
-}
+# Category alias sets, in priority order (first match wins). Each alias is
+# matched as a whole word / phrase via a word-boundary regex, so e.g. "ai"
+# never matches inside "said" and "tech" never matches inside "biotech".
+# The narrower "ai" is listed ahead of the broader "technology".
+_CATEGORY_ALIASES: List[Tuple[str, str, List[str]]] = [
+    ("ai", AI_NEWS, [
+        "ai", "artificial intelligence", "machine learning",
+        "ml", "llm", "gpt", "chatbot", "neural network",
+    ]),
+    ("technology", TECHNOLOGY_NEWS, [
+        "tech", "technology", "software", "hardware", "gadget",
+        "computing", "computer", "chip", "silicon",
+    ]),
+    ("startup", STARTUP_NEWS, [
+        "startup", "startups", "venture", "funding", "entrepreneur",
+    ]),
+    ("business", BUSINESS_NEWS, [
+        "business", "businesses", "company", "companies", "corporate",
+        "corporation", "ceo", "enterprise",
+    ]),
+    ("science", SCIENCE_NEWS, [
+        "science", "scientific", "scientist", "research", "researcher",
+        "study", "physics", "chemistry", "biology", "space", "nasa", "astronomy",
+    ]),
+    ("politics", POLITICS_NEWS, [
+        "politics", "political", "election", "government", "president",
+        "senate", "congress", "parliament", "policy", "policies", "vote", "campaign",
+    ]),
+    ("finance", FINANCE_NEWS, [
+        "finance", "financial", "market", "markets", "stock", "stocks",
+        "economy", "economic", "money", "crypto", "bitcoin", "trading",
+        "invest", "investor",
+    ]),
+    ("world", WORLD_NEWS, [
+        "world", "global", "international", "foreign", "country", "countries",
+        "nation", "nations",
+    ]),
+    ("sports", SPORTS_NEWS, [
+        "sport", "sports", "football", "soccer", "basketball", "nba",
+        "cricket", "olympic", "match", "game",
+    ]),
+]
+
+# Precompile once at import time so per-call matching stays O(phrases) and
+# adds no per-request regex cost.
+_CATEGORY_PATTERNS: List[Tuple[str, str, List[re.Pattern[str]]]] = [
+    (cat, intent, [re.compile(r"\b" + re.escape(kw) + r"\b") for kw in kws])
+    for cat, intent, kws in _CATEGORY_ALIASES
+]
 
 # Generic "give me news" phrasing.
 _LATEST = ["latest", "recent", "headline", "headlines", "news", "what's new",
@@ -90,10 +131,10 @@ class ConversationManager:
             query = m.group(2).strip()
             return Intent(EXPLAIN_ARTICLE, text, query=query or None)
 
-        # 4) Category-scoped news.
-        for category, keywords in _CATEGORY_KEYWORDS.items():
-            if any(k in lowered for k in keywords):
-                return Intent(_CATEGORY_INTENT[category], text, category=category)
+        # 4) Category-scoped news (whole-word / phrase match, priority order).
+        for cat, intent, patterns in _CATEGORY_PATTERNS:
+            if any(p.search(lowered) for p in patterns):
+                return Intent(intent, text, category=cat)
 
         # 5) Generic latest news.
         if any(k in lowered for k in _LATEST):
