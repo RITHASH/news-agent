@@ -1,70 +1,77 @@
-# News Agent
+# 📰 News Agent — "Jarvis"
 
-A local-first, voice-controlled AI news assistant. Say **"Jarvis"**, ask for the
-latest technology / startup / world / sports news (or "tell me more about the
-first story"), and it reads you a spoken briefing built from live sources —
-no cloud TTS, no cloud STT, no keys for the core pipeline.
+> A local-first, voice-controlled AI news assistant. Say **"Jarvis"**, ask for
+> the latest technology / startup / world / sports news, and it reads you a
+> spoken briefing built from live sources — **no cloud TTS, no cloud STT, and no
+> keys required for the core pipeline.**
 
-The news pipeline is **fully offline and deterministic**: it fetches from RSS
-and several external sources, de-duplicates and ranks articles, and uses an
-LLM (via OpenRouter) to enrich the top stories with a one-line summary, why it
-matters, and possible impact. Speech synthesis (Kokoro), speech recognition
-(Vosk), and the wake word are all run locally.
+News Agent ("Jarvis") fetches news from many sources at once, deduplicates and
+ranks it, and — optionally — uses an LLM to enrich the top stories with a
+one-line summary, *why it matters*, and *possible impact*. It then speaks the
+briefing aloud using a **local neural TTS** engine, listens for your follow-up
+questions, and remembers your preferences across restarts. Everything that can
+be local, **is** local: speech synthesis (Kokoro), speech recognition and the
+wake word (Vosk).
 
 ---
 
-## Features
+## ✨ What it does
 
-- **Wake-word activation** — listens for "Jarvis" locally with Vosk; no cloud,
-  minimal CPU while idle.
+- **Wake-word activation** — says nothing and uses almost no CPU until it hears
+  *"Jarvis"* locally with Vosk.
 - **Spoken morning briefing** — a time-aware, fully scripted briefing read aloud
   at startup, built entirely from live data (no hardcoded facts).
-- **Multi-source fetching** — RSS (BBC/CNN/Reuters) plus Exa, YouTube, X/Twitter,
-  Reddit, and LinkedIn. Every source degrades gracefully if its CLI/tool or auth
-  is missing, so the run always completes.
+- **Multi-source fetching** — RSS (BBC / CNN / Reuters) plus Exa, YouTube,
+  X/Twitter, Reddit, and LinkedIn. Every source **degrades gracefully** if its
+  CLI or auth is missing, so the run always completes.
 - **Deterministic ranking** — de-duplication, keyword categorization, and a
   recency + source + signal scoring model. No LLM needed for the core pipeline.
-- **LLM enrichment** — OpenRouter chat-completions add structured analysis to the
-  most important articles (optional; the pipeline runs without a key).
-- **Local neural TTS** — Kokoro ONNX model for natural speech, with a headless
-  fallback.
-- **Rule-based conversation router** — fast, predictable intent matching (no LLM
-  in the hot path).
-- **Conversation context & follow-ups** — within a session, JARVIS remembers the
-  current category and the stories it just read, so you can say *"next"*,
-  *"previous"*, *"first / second / third story"*, *"tell me more"*, *"repeat"*,
-  or *"explain the first story"* without re-fetching.
-- **Long-term user preferences** — tell JARVIS what you like and it remembers
-  across restarts, persisted to a local JSON file (no cloud). Set preferred
-  categories (*"remember I like AI news"*, *"put technology first"*), the number
-  of stories (*"read only three stories"*), and whether to use AI summaries
-  (*"turn AI summaries off"*); ask *"what do you remember about me?"*, or
-  *"forget my preferences"* to reset.
+- **Optional LLM enrichment** — OpenRouter chat-completions add structured
+  analysis to the most important articles.
+- **Local neural TTS** — Kokoro ONNX model for natural speech, with a
+  headless text fallback.
+- **Conversation context & follow-ups** — within a session, Jarvis remembers the
+  stories it just read, so you can navigate without re-fetching (see
+  [Voice Commands](#-voice-commands)).
+- **Long-term user preferences** — tell Jarvis what you like and it remembers
+  across restarts (see [Preferences](#-preferences)).
 - **Pluggable engines** — swap TTS / wake-word engines by dropping in one module
-  and setting an env var.
+  and setting an environment variable.
 
 ---
 
-## Architecture
+## 🏗️ Architecture
 
 ```
 main.py
   └─ NewsAgent (app/agent)            # orchestrator: wake-word <-> session loop
-       ├─ WakeWordDetector (app/wakeword)   # Vosk "jarvis" listener
-       ├─ SpeechRecognizer (app/voice/stt)  # Vosk STT (one utterance)
+       ├─ WakeWordDetector (app/wakeword)    # Vosk "jarvis" listener
+       ├─ SpeechRecognizer (app/voice/stt)   # Vosk STT (one utterance)
        ├─ ConversationManager (app/conversation)  # rule-based intent router
-       ├─ Preferences (app/preferences)     # long-term user preferences (JSON)
-       ├─ MorningBriefing (app/briefing)    # builds + speaks the briefing
-       │    ├─ NewsFetcher (app/fetchers)   # concurrent multi-source fetch
+       ├─ Preferences (app/preferences)      # long-term user preferences (JSON)
+       ├─ MorningBriefing (app/briefing)     # builds + speaks the briefing
+       │    ├─ NewsFetcher (app/fetchers)    # concurrent multi-source fetch
        │    ├─ NewsProcessor (app/processors)  # dedupe / categorize / score
-       │    └─ NewsSummarizer (app/agents)  # OpenRouter LLM enrichment
-       └─ VoiceAgent (app/voice)            # speaks via a TTSEngine
+       │    └─ NewsSummarizer (app/agents)   # OpenRouter LLM enrichment
+       └─ VoiceAgent (app/voice)             # speaks via a TTSEngine
             └─ KokoroTTS (app/voice/kokoro_tts)  # local neural TTS
 ```
 
-**Lifecycle:** at startup the agent runs one morning briefing, then enters a
-wake-word loop — `idle → (hear "jarvis") → session → (Stop / idle timeout) → idle`.
-The microphone is idle while responses are spoken.
+**Pipeline:** `Fetch (concurrent)` → `Process (dedupe · categorize · score · sort)`
+→ `Summarize (LLM, top‑N, optional)` → `Speak (streamed)`.
+
+**Lifecycle (a small state machine):**
+
+```
+SLEEPING  ──(hear "jarvis")──▶  LISTENING  ──(speak)──▶  SPEAKING
+   ▲                              │   ▲                      │
+   └────(Stop / Sleep / idle)─────┘   └────(done speaking)───┘
+```
+
+While **SLEEPING**, the mic only waits for the wake word and ignores everything
+else. While **LISTENING**, it accepts and routes commands. While **SPEAKING**,
+the mic stays idle until it finishes. Conversation history is **never** stored
+cross-session — the next wake starts with a blank slate.
 
 **Resilience:** each fetcher source and the summarizer report an `ok (N)` /
 `skipped: <reason>` / `error: ...` status instead of throwing, so a missing CLI,
@@ -72,21 +79,21 @@ an unauthenticated source, or a throttled LLM never takes down the run.
 
 ---
 
-## Tech Stack
+## 🧰 Tech Stack
 
-| Concern            | Technology                                            |
-|--------------------|-------------------------------------------------------|
-| Language           | Python 3.14                                           |
-| Data model         | Pydantic v2                                           |
-| News parsing       | `feedparser`                                          |
-| LLM enrichment     | `openai` client against OpenRouter (OpenAI-compatible)|
-| Text-to-Speech     | `kokoro-onnx` (local neural TTS)                      |
-| Speech / wake word | `vosk` + `sounddevice` (local, offline)               |
-| External sources   | `mcporter` (Exa/LinkedIn MCP), `yt-dlp`, `twitter-cli`, `rdt-cli` |
+| Concern             | Technology                                            |
+|---------------------|-------------------------------------------------------|
+| Language            | Python 3.14                                           |
+| Data model          | Pydantic v2                                           |
+| News parsing        | `feedparser`                                          |
+| LLM enrichment      | `openai` client against OpenRouter (OpenAI-compatible)|
+| Text-to-Speech      | `kokoro-onnx` (local neural TTS)                      |
+| Speech / wake word  | `vosk` + `sounddevice` (local, offline)               |
+| External sources    | `mcporter` (Exa/LinkedIn MCP), `yt-dlp`, `twitter-cli`, `rdt-cli` |
 
 ---
 
-## Installation
+## 🚀 Installation
 
 Requires **Python 3.14+**.
 
@@ -111,7 +118,7 @@ python -m pip install -r requirements.txt
 
 ---
 
-## Environment Setup
+## 🔑 Environment Setup
 
 Copy the example env file and fill in what you need:
 
@@ -128,12 +135,10 @@ cp .env.example .env
 | `TTS_ENGINE`         | Optional | TTS engine name (default: `kokoro`).                           |
 | `WAKEWORD_ENGINE`    | Optional | Wake-word engine name (default: `vosk`).                       |
 
-The pipeline works without any keys — you only lose LLM enrichment (and the X
-source) if they're absent.
+**The pipeline works without any keys** — you only lose LLM enrichment (and the
+X source) if they're absent.
 
-### Optional external CLIs
-
-These unlock extra sources and are auto-detected; missing ones are skipped:
+### Optional external CLIs (auto-detected; missing ones are skipped)
 
 - **Exa / LinkedIn** — `npm i -g mcporter` (configured via `config/mcporter.json`)
 - **YouTube** — `pip install yt-dlp`
@@ -142,7 +147,7 @@ These unlock extra sources and are auto-detected; missing ones are skipped:
 
 ---
 
-## Running the Project
+## ▶️ Running
 
 ```bash
 # from the activated venv, in the project root
@@ -152,39 +157,106 @@ python main.py
 You'll see a morning briefing printed and spoken, then:
 
 ```
-[JARVIS] Listening for wake word...
+[JARVIS] Sleeping - waiting for wake word 'JARVIS'...
 ```
 
-Say **"Jarvis"**, then try:
-
-- *"latest news"*, *"technology news"*, *"startup news"*, *"world news"*, *"sports news"*
-- *"tell me more about the first story"* — or, after a briefing, just *"explain the first story"*
-- *"next"*, *"previous"*, *"first story"*, *"third one"* — move through the stories already read
-- *"tell me more"* — expand the story you're currently on
-- *"repeat"* — hear the last thing JARVIS said again
-- *"remember that I like AI news"*, *"read only three stories"*, *"turn AI summaries off"*
-- *"what do you remember about me?"*, *"forget my preferences"*
-- *"stop"* (ends the session, returns to wake-word listening)
+Say **"Jarvis"**, then try the commands below.
 
 ---
 
-## Configuration
+## 🎙️ Voice Commands
+
+Once awake, you can speak naturally. Commands are matched by a fast,
+deterministic rule engine — **no LLM in the hot path**.
+
+### News & briefings
+
+| Say…                                              | Does…                                              |
+|---------------------------------------------------|----------------------------------------------------|
+| *"latest news"* / *"technology news"* / *"startup news"* / *"world news"* / *"sports news"* | Fetches and reads that category (cache-backed). |
+| *"good morning"* / *"briefing"*                   | Replays the full morning briefing.                 |
+| *"tell me more about the first story"*            | Deep-dive on a specific story by name.             |
+| *"explain the first story"*                       | Same, after a briefing is already in context.      |
+
+### Conversation follow-ups (no re-fetch)
+
+| Say…                          | Does…                                            |
+|-------------------------------|--------------------------------------------------|
+| *"next"* / *"skip"* / *"continue"* | Read the next story in the list.             |
+| *"previous"* / *"back"*       | Read the previous story.                          |
+| *"first story"* / *"second one"* / *"third story"* | Jump straight to that story.           |
+| *"tell me more"*              | Expand the story you're currently on.             |
+| *"repeat"*                    | Hear the last thing Jarvis said again.            |
+
+At the start or end of the list, Jarvis simply tells you there are no more
+stories — it never wraps around silently.
+
+### Preferences
+
+| Say…                                                    | Does…                                                  |
+|---------------------------------------------------------|--------------------------------------------------------|
+| *"remember that I like AI news"*                        | Adds a preferred category.                             |
+| *"remember that I prefer technology first"*            | Adds a category and moves it to the front of briefings.|
+| *"read only three stories"*                             | Sets how many stories to read at a time.              |
+| *"turn AI summaries off"* / *"turn AI summaries on"*   | Toggles LLM enrichment.                               |
+| *"what do you remember about me?"*                     | Recaps your saved preferences.                         |
+| *"forget my preferences"* / *"reset my preferences"*   | Clears everything back to defaults.                   |
+
+### Session control
+
+| Say…                          | Does…                                            |
+|-------------------------------|--------------------------------------------------|
+| *"stop"* / *"goodbye"* / *"exit"* | Ends the session, returns to wake-word listening. |
+| *"go to sleep"* / *"sleep"*   | Pauses voice commands until the next wake word.   |
+
+---
+
+## 👤 Preferences
+
+Preferences are stored locally in **`config/user_preferences.json`** (git-ignored,
+never committed) and reloaded on every start. They cover only four knobs:
+
+- **Preferred categories** — e.g. AI, technology, sports (ordered; preferred
+  categories are read first in the morning briefing, then the rest).
+- **Stories per briefing** — how many stories to read (default **5**).
+- **AI summaries** — whether LLM enrichment is on (default **on**).
+
+The file is written atomically (temp file + replace) and is **never** used to
+store conversation history or anything sensitive. If the file is missing,
+corrupt, or contains invalid values, Jarvis falls back to safe defaults and
+keeps running.
+
+---
+
+## ⚙️ Configuration
 
 Most behavior is configured through environment variables (see above) or the
-`NewsAgent(...)` constructor in `main.py` (`query`, `top_n`, `max_per_source`,
-`session_timeout`). Source lists and ranking weights live in
-`app/fetchers/news_fetcher.py` and `app/processors/news_processor.py`.
+`NewsAgent(...)` constructor in `main.py`:
+
+```python
+NewsAgent(
+    query="technology news",   # default category for the morning briefing
+    top_n=5,                   # stories to read (overridden by saved prefs)
+    max_per_source=5,          # articles pulled from each source
+    session_timeout=25.0,      # seconds of silence before auto-sleep
+    cache_ttl=300.0,           # seconds before a cached fetch is refreshed
+)
+```
+
+Source lists and ranking weights live in `app/fetchers/news_fetcher.py` and
+`app/processors/news_processor.py`.
 
 ---
 
-## Folder Structure
+## 📁 Folder Structure
 
 ```
 news-agent/
 ├── main.py                  # Entry point: env load, UTF-8 streams, run NewsAgent
 ├── requirements.txt         # Pinned runtime dependencies
 ├── config/
-│   └── mcporter.json        # MCP server config (Exa) for mcporter
+│   ├── mcporter.json        # MCP server config (Exa) for mcporter
+│   └── user_preferences.json  # Your preferences (created at runtime, git-ignored)
 ├── app/
 │   ├── agent/               # NewsAgent orchestrator
 │   ├── agents/              # NewsSummarizer (LLM enrichment)
@@ -192,8 +264,8 @@ news-agent/
 │   ├── conversation/        # Rule-based intent router
 │   ├── fetchers/            # NewsFetcher (multi-source, concurrent)
 │   ├── models/              # NewsArticle data model
-│   ├── processors/          # Dedupe / categorize / score
 │   ├── preferences/         # Long-term user preferences (local JSON)
+│   ├── processors/          # Dedupe / categorize / score
 │   ├── voice/               # TTS engine, Kokoro, STT, VoiceAgent
 │   ├── wakeword/            # Vosk wake-word detector
 │   ├── api/                 # Reserved (future)
@@ -205,7 +277,7 @@ news-agent/
 
 ---
 
-## Current Capabilities
+## ✅ Current Capabilities
 
 - Local wake word ("Jarvis"), local STT, and local neural TTS.
 - Concurrent fetch from 6 source types with graceful degradation.
@@ -220,7 +292,7 @@ news-agent/
 
 ---
 
-## Known Limitations
+## ⚠️ Known Limitations
 
 - **X / Reddit / LinkedIn** require external CLIs and authentication; they are
   skipped automatically when unavailable.
@@ -233,7 +305,7 @@ news-agent/
 
 ---
 
-## Future Roadmap
+## 🗺️ Future Roadmap
 
 - Implement the reserved packages: `app/api` (HTTP API), `app/memory`
   (persistent article store), `app/config` (settings loader), `app/utils`.
@@ -243,6 +315,6 @@ news-agent/
 
 ---
 
-## License
+## 📜 License
 
 Released under the [MIT License](LICENSE).
