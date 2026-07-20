@@ -21,6 +21,14 @@ REPEAT = "Repeat"
 STOP = "Stop"
 UNKNOWN = "Unknown"
 
+# Conversation-context follow-ups (no LLM). These act on the session's
+# remembered category / article list / selected article rather than fetching
+# fresh news. Kept as constants so NewsAgent routes on names, never strings.
+TELL_MORE = "TellMore"       # "tell me more" / "more" -> explain selected story
+NEXT = "Next"                # "next" / "skip" / "continue" -> advance selection
+PREVIOUS = "Previous"        # "previous" / "back" -> step back selection
+SELECT_STORY = "SelectStory" # "first story" / "third one" -> jump to ordinal
+
 
 @dataclass
 class Intent:
@@ -31,6 +39,7 @@ class Intent:
     raw: str
     category: Optional[str] = None   # set for *News category intents
     query: Optional[str] = None      # set for ExplainArticle (the article ref)
+    index: Optional[int] = None      # set for SelectStory (0-based ordinal)
     confidence: float = 1.0
 
     def __str__(self) -> str:
@@ -107,6 +116,64 @@ _EXPLAIN_RE = re.compile(
     re.I,
 )
 
+# --- Conversation-context follow-ups -------------------------------------
+# These only make sense inside an active session (NewsAgent supplies the
+# context). The regexes are deliberately narrow so they never steal a phrase
+# that belongs to EXPLAIN / CATEGORY / LATEST:
+#  * "more about X" / "more on X" must stay EXPLAIN  -> handled at step 3,
+#    and TELL_MORE's negative lookahead also rejects "more news".
+#  * "more technology news" must stay a CATEGORY fetch -> CATEGORY is checked
+#    before TELL_MORE, and "news" is excluded by the lookahead anyway.
+_TELL_MORE_RE = re.compile(
+    r"\b(tell me more|more)\b(?!\s+(?:about|on|news))",
+    re.I,
+)
+
+# Advance / step back through the current article list.
+_NAV_NEXT = [
+    "next", "next story", "next one", "skip", "skip this", "skip story",
+    "continue", "continue reading", "keep going", "go on",
+]
+_NAV_PREV = [
+    "previous", "previous story", "previous one", "back", "go back",
+]
+_NAV_NEXT_RE = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in _NAV_NEXT) + r")\b", re.I,
+)
+_NAV_PREV_RE = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in _NAV_PREV) + r")\b", re.I,
+)
+
+# Jump straight to "first/second/... story" (or "... one" / "... article").
+# Word ordinals and suffixed digits take an optional noun; a bare digit is
+# only honored when it is immediately followed by a noun, so "top 5 stories"
+# never collapses into SelectStory. Captured for the 0-based index lookup.
+_ORDINALS = {
+    "first": 0, "1st": 0,
+    "second": 1, "2nd": 1,
+    "third": 2, "3rd": 2,
+    "fourth": 3, "4th": 3,
+    "fifth": 4, "5th": 4,
+    "1": 0, "2": 1, "3": 2, "4": 3, "5": 4,
+}
+_STORY_ORDINAL_RE = re.compile(
+    r"\b(first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)\b"
+    r"(?:\s*(?:story|one|article))?",
+    re.I,
+)
+_STORY_DIGIT_RE = re.compile(r"\b([1-5])\s+(?:story|one|article)\b", re.I)
+
+
+def _ordinal_index(text: str) -> Optional[int]:
+    """Return the 0-based index for an ordinal story reference, else None."""
+    m = _STORY_ORDINAL_RE.search(text)
+    if m:
+        return _ORDINALS.get(m.group(1).lower())
+    m = _STORY_DIGIT_RE.search(text)
+    if m:
+        return _ORDINALS.get(m.group(1))
+    return None
+
 
 class ConversationManager:
     """Deterministic intent router. No LLM — pure keyword/rule matching,
@@ -136,13 +203,32 @@ class ConversationManager:
             if any(p.search(lowered) for p in patterns):
                 return Intent(intent, text, category=cat)
 
-        # 5) Generic latest news.
+        # 5) Pick a story by ordinal, e.g. "first story" / "third one".
+        idx = _ordinal_index(lowered)
+        if idx is not None:
+            return Intent(SELECT_STORY, text, index=idx)
+
+        # 6) "tell me more" / "more" -> expand the currently selected story.
+        #    Negative lookahead (see _TELL_MORE_RE) keeps "more about X" and
+        #    "more news" out of here; both map to EXPLAIN / CATEGORY above.
+        if _TELL_MORE_RE.search(lowered):
+            return Intent(TELL_MORE, text)
+
+        # 7) Advance through the current article list.
+        if _NAV_NEXT_RE.search(lowered):
+            return Intent(NEXT, text)
+
+        # 8) Step back through the current article list.
+        if _NAV_PREV_RE.search(lowered):
+            return Intent(PREVIOUS, text)
+
+        # 9) Generic latest news.
         if any(k in lowered for k in _LATEST):
             return Intent(LATEST_NEWS, text)
 
-        # 6) Repeat the last response.
+        # 10) Repeat the last response.
         if any(k in lowered for k in _REPEAT):
             return Intent(REPEAT, text)
 
-        # 7) Fallback.
+        # 11) Fallback.
         return Intent(UNKNOWN, text, confidence=0.0)

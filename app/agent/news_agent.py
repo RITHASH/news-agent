@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import re
 import time
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional
 
@@ -16,12 +18,16 @@ from app.conversation import (
     FINANCE_NEWS,
     LATEST_NEWS,
     MORNING_BRIEF,
+    NEXT,
     POLITICS_NEWS,
+    PREVIOUS,
     REPEAT,
     SCIENCE_NEWS,
+    SELECT_STORY,
     SPORTS_NEWS,
     STARTUP_NEWS,
     STOP,
+    TELL_MORE,
     TECHNOLOGY_NEWS,
     WORLD_NEWS,
 )
@@ -71,6 +77,64 @@ _SLEEP_RE = re.compile(
 def _is_sleep_command(text: Optional[str]) -> bool:
     """Return True if ``text`` is a request to enter Sleep Mode."""
     return bool(text) and bool(_SLEEP_RE.search(text))
+
+
+@dataclass
+class ConversationContext:
+    """Lightweight, LLM-free memory of the current conversation session.
+
+    Persists only while a session is live; :meth:`NewsAgent._clear_context`
+    resets it on every session boundary (Sleep / Stop / idle timeout). It
+    captures exactly what follow-up commands need:
+
+    * ``category``       - the news category in focus (e.g. "technology news").
+    * ``articles``       - the ordered, ranked list the user is reading.
+    * ``selected_index`` - which story is "current" (0-based).
+    * ``last_response``  - the most recent thing JARVIS said, for continuity.
+
+    Nothing here is cross-session; the next wake starts blank.
+    """
+
+    category: Optional[str] = None
+    articles: List["NewsArticle"] = field(default_factory=list)
+    selected_index: int = 0
+    last_response: str = ""
+
+    @property
+    def has_articles(self) -> bool:
+        return bool(self.articles)
+
+
+_ORDINAL_WORDS = ["first", "second", "third", "fourth", "fifth"]
+
+# --- Natural voice wording -------------------------------------------------
+# Short, human acknowledgments drawn at random so JARVIS stops sounding like a
+# fixed tape loop. These are PURE wording variants: they never change routing,
+# the three-state machine (Sleeping/Listening/Speaking), the cache, the fetch
+# pipeline, or the streaming pipeline. A caller picks one via ``_pick``.
+_WAKE_LINES = ["Yes?", "I'm listening.", "Go ahead."]
+_SLEEP_LINES = ["Going to sleep.", "See you later.", "Sleeping now."]
+_END_LINES = ["Goodbye.", "Talk to you later.", "See you soon."]
+_NO_MORE_LINES = [
+    "That's all for now.",
+    "You've heard all the stories.",
+    "Nothing else in this category.",
+]
+_START_LINES = [
+    "That's the first story.",
+    "We're already at the start.",
+    "This is the first one.",
+]
+_ERROR_LINES = [
+    "I didn't catch that.",
+    "Could you repeat that?",
+    "I'm not sure what you meant.",
+]
+
+
+def _pick(lines: List[str]) -> str:
+    """Choose one acknowledgment at random (always a valid, listed phrase)."""
+    return random.choice(lines)
 
 
 class NewsAgent:
@@ -123,6 +187,9 @@ class NewsAgent:
         # Explicit lifecycle state (see AgentState). Drives idle behavior and
         # guards against accidental or duplicate wake / transition events.
         self.state = AgentState.SLEEPING
+        # In-session conversation memory (category / articles / selection).
+        # Reset on every session boundary so a new wake starts blank.
+        self.context = ConversationContext()
 
     def _set_state(self, new: "AgentState") -> None:
         """Transition to ``new`` state, logging only on an actual change."""
@@ -131,6 +198,23 @@ class NewsAgent:
         prev = self.state
         self.state = new
         print(f"[state] {prev.value} -> {new.value}")
+
+    def _clear_context(self) -> None:
+        """Drop all in-session memory. Called on every session boundary so a
+        fresh wake starts with a clean slate (no leaked category/articles)."""
+        self.context = ConversationContext()
+
+    def _set_context(self, category: Optional[str], articles: List["NewsArticle"]) -> None:
+        """Record the category and ordered article list now in focus.
+
+        Selection resets to the first story and ``last_response`` is synced to
+        whatever was just spoken, keeping follow-up commands anchored to the
+        list the user actually heard.
+        """
+        self.context.category = category
+        self.context.articles = list(articles)
+        self.context.selected_index = 0
+        self.context.last_response = self._last_spoken
 
     async def start(self) -> None:
         self.voice = VoiceAgent(get_tts_engine(), top_n=self.top_n)
@@ -160,6 +244,7 @@ class NewsAgent:
 
     async def _run_session(self) -> None:
         self._shutdown.clear()
+        self._clear_context()  # defensive: start every session with a blank slate
         self._set_state(AgentState.LISTENING)
         print("[JARVIS] Listening...")
         last_speech = time.monotonic()
@@ -176,6 +261,7 @@ class NewsAgent:
                     # Idle too long: go back to sleep.
                     self._shutdown.set()
                     await self._respond("Going back to sleep.")
+                    self._clear_context()
                     self._set_state(AgentState.SLEEPING)
                     return
                 continue
@@ -202,7 +288,7 @@ class NewsAgent:
             return
         self._set_state(AgentState.SPEAKING)  # short acknowledgment
         try:
-            self.voice.speak("Yes?")
+            self.voice.speak(_pick(_WAKE_LINES))
         except Exception as e:
             print(f"[voice] wake acknowledgment failed: {e}")
         self._set_state(AgentState.LISTENING)
@@ -213,10 +299,12 @@ class NewsAgent:
 
         Sets the session-shutdown event first so the speaking state is not
         reset to LISTENING by ``_respond``; the loop then returns to the
-        wake-word wait without terminating the process.
+        wake-word wait without terminating the process. Context is dropped so
+        the next wake starts fresh.
         """
         self._shutdown.set()
-        await self._respond("Going to sleep.")
+        await self._respond(_pick(_SLEEP_LINES))
+        self._clear_context()
         self._set_state(AgentState.SLEEPING)
         print("[JARVIS] Sleeping - voice commands paused.")
 
@@ -228,7 +316,8 @@ class NewsAgent:
         if name == STOP:
             # End this session and return to wake-word listening.
             self._shutdown.set()
-            await self._respond("Goodbye for now.")
+            await self._respond(_pick(_END_LINES))
+            self._clear_context()
             self._set_state(AgentState.SLEEPING)
             return
         if name == REPEAT:
@@ -240,20 +329,32 @@ class NewsAgent:
         if name == MORNING_BRIEF:
             self._set_state(AgentState.SPEAKING)
             self._last_articles = await self.briefing.run()
+            self._set_context("morning brief", self._last_articles)
             if not self._shutdown.is_set():
                 self._set_state(AgentState.LISTENING)
             return
         if name == EXPLAIN_ARTICLE:
             await self._explain(intent)
             return
+        if name == TELL_MORE:
+            # Expand the currently selected story (no new fetch).
+            await self._explain_current()
+            return
+        if name == NEXT:
+            await self._navigate(1)
+            return
+        if name == PREVIOUS:
+            await self._navigate(-1)
+            return
+        if name == SELECT_STORY:
+            await self._select_ordinal(intent)
+            return
         if name in _QUERY_FOR:
             self._last_articles = await self._fetch_and_speak(_QUERY_FOR[name])
+            self._set_context(_QUERY_FOR[name], self._last_articles)
             return
-        # Unknown / fallback.
-        await self._respond(
-            "Sorry, I didn't catch that. You can ask for latest, technology, "
-            "startup, world, or sports news."
-        )
+        # Unknown / fallback: a brief, natural nudge (no long menu read-out).
+        await self._respond(_pick(_ERROR_LINES))
 
     # ------------------------------------------------------------------ #
     # actions
@@ -371,13 +472,9 @@ class NewsAgent:
         # partially updated cache.
         self.cache.put(query, articles)
 
-    async def _explain(self, intent) -> None:
-        arts = self._last_articles
-        if not arts:
-            await self._respond("I haven't read any stories yet.")
-            return
-        idx = self._resolve_index(intent.query, len(arts))
-        if idx is None or idx >= len(arts):
+    async def _explain_at(self, arts: List["NewsArticle"], idx: Optional[int]) -> None:
+        """Read the deep-dive for story ``idx`` (title + summary + why/impact)."""
+        if idx is None or idx < 0 or idx >= len(arts):
             await self._respond(
                 "I'm not sure which story you mean. "
                 "Try 'tell me more about the first story'."
@@ -395,6 +492,70 @@ class NewsAgent:
             lines.append("Possible impact: " + a.possible_impact)
         await self._respond(*lines)
 
+    async def _explain(self, intent) -> None:
+        """Deep-dive on a story referenced by an explicit ExplainArticle intent."""
+        arts = self._last_articles
+        if not arts:
+            await self._respond("I haven't read any stories yet.")
+            return
+        idx = self._resolve_index(intent.query, len(arts))
+        await self._explain_at(arts, idx)
+
+    async def _explain_current(self) -> None:
+        """Deep-dive on whatever story is currently selected in the context."""
+        if not self.context.has_articles:
+            await self._respond("I haven't read any stories yet.")
+            return
+        await self._explain_at(self.context.articles, self.context.selected_index)
+
+    async def _read_story(self, i: int) -> None:
+        """Read a single story (by index) from the current context aloud."""
+        arts = self.context.articles
+        if not arts or i < 0 or i >= len(arts):
+            await self._respond("I'm not sure which story you mean.")
+            return
+        line = VoiceAgent._to_speech(arts[i], i + 1)
+        await self._respond(line)
+
+    async def _navigate(self, delta: int) -> None:
+        """Move the selection by ``delta`` (+1 next / -1 previous) and read it.
+
+        At either end of the list the selection stays put and JARVIS says so,
+        rather than silently wrapping or erroring.
+        """
+        arts = self.context.articles
+        if not arts:
+            await self._respond("I haven't read any stories yet.")
+            return
+        cur = self.context.selected_index
+        new = cur + delta
+        if new < 0:
+            await self._respond(_pick(_START_LINES))
+            return
+        if new >= len(arts):
+            await self._respond(_pick(_NO_MORE_LINES))
+            return
+        # Navigation is confirmation-free by design: just read the next story
+        # instead of announcing "moving to the next story...".
+        self.context.selected_index = new
+        await self._read_story(new)
+
+    async def _select_ordinal(self, intent) -> None:
+        """Jump straight to the ordinal story named in a SelectStory intent."""
+        arts = self.context.articles
+        if not arts:
+            await self._respond("I haven't read any stories yet.")
+            return
+        idx = intent.index or 0
+        if idx >= len(arts):
+            top = _ORDINAL_WORDS[min(len(arts), 5) - 1]
+            await self._respond(
+                f"I only have {len(arts)} stories, from the first to the {top}."
+            )
+            return
+        self.context.selected_index = idx
+        await self._read_story(idx)
+
     @staticmethod
     def _resolve_index(query: Optional[str], n: int) -> Optional[int]:
         if not query:
@@ -405,6 +566,7 @@ class NewsAgent:
             "second": 1, "2nd": 1, "2": 1,
             "third": 2, "3rd": 2, "3": 2,
             "fourth": 3, "4th": 3, "4": 3,
+            "fifth": 4, "5th": 4, "5": 4,
         }
         for word, i in ordinals.items():
             if word in q:
@@ -422,6 +584,9 @@ class NewsAgent:
             # Speak off the event loop so the mic stays idle until done.
             await loop.run_in_executor(None, self.voice.speak, line)
         self._last_spoken = text
+        # Mirror into the session context so follow-up continuity ("what was
+        # that?") and any future response-aware logic can read the last line.
+        self.context.last_response = text
         # Stay in SPEAKING only if the session is ending (shutdown set);
         # otherwise we're back to listening for the next command.
         if not self._shutdown.is_set():
