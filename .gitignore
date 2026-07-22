@@ -71,5 +71,11 @@ vosk-model-*
 # --- Local user preferences (written at runtime by the preferences layer) ---
 config/user_preferences.json
 
+# --- Debug / runtime artifacts (generated during testing) ---
+app_error*.txt
+app_output*.txt
+process_id*.txt
+shutdown_*.txt
+
 # --- Generated audio ---
 *.wav

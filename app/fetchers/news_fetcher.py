@@ -103,7 +103,6 @@ class NewsFetcher:
             self._fetch_youtube(),
             self._fetch_x(),
             self._fetch_reddit(),
-            self._fetch_linkedin(),
             return_exceptions=True,
         )
         articles: List[NewsArticle] = []
@@ -128,7 +127,6 @@ class NewsFetcher:
             self._fetch_youtube(),
             self._fetch_x(),
             self._fetch_reddit(),
-            self._fetch_linkedin(),
         ]
         for done in asyncio.as_completed(tasks):
             batch = await done
@@ -320,6 +318,10 @@ class NewsFetcher:
 
     @staticmethod
     def _parse_exa_block(text: str) -> List[dict]:
+        # Exa emits one article per block: Title / URL / Published / Author, in
+        # that order. A new article therefore begins at each "Title:" line, so we
+        # flush the previous one there (not on "URL:", which would orphan the
+        # title into a URL-less item and drop it in _make_article).
         items: List[dict] = []
         cur: dict = {}
         for line in text.splitlines():
@@ -327,9 +329,8 @@ class NewsFetcher:
             if m:
                 key = m.group(1).lower()
                 val = m.group(2).strip()
-                if key == "url":
-                    if cur:
-                        items.append(cur)
+                if key == "title" and cur:
+                    items.append(cur)
                     cur = {}
                 cur[key] = val
         if cur:
@@ -507,53 +508,7 @@ class NewsFetcher:
             })
         return result
 
-    # ------------------------------------------------------------------ #
-    # LinkedIn  (linkedin-scraper MCP via mcporter, needs session)
-    # ------------------------------------------------------------------ #
-    async def _fetch_linkedin(self) -> List[NewsArticle]:
-        try:
-            out = await self._run_cli(
-                ["mcporter", "call",
-                 f'linkedin-scraper.search_jobs(keyword: "{self.query}", limit: {self.max_per_source})',
-                 "--output", "json"],
-                timeout=60,
-            )
-            data = json.loads(out)
-            items: List[dict] = []
-            for block in data.get("content", []):
-                items.extend(self._parse_linkedin_text(block.get("text", "")))
-            articles = self._to_articles(self, items, "LinkedIn")
-            if articles:
-                self.status["linkedin"] = f"ok ({len(articles)})"
-                return articles
-            raise RuntimeError("no parseable LinkedIn results")
-        except FileNotFoundError as e:
-            self.status["linkedin"] = f"skipped: linkedin-scraper MCP not found ({e})"
-        except Exception as e:
-            self.status["linkedin"] = (
-                "skipped: LinkedIn MCP not configured/authenticated - register it with "
-                "`mcporter config add linkedin-scraper <server-url>` and provide a "
-                f"LinkedIn session. Last error: {str(e)[:160]}"
-            )
-        return []
-
-    @staticmethod
-    def _parse_linkedin_text(text: str) -> List[dict]:
-        try:
-            j = json.loads(text)
-            items = j if isinstance(j, list) else [j]
-        except Exception:
-            return []
-        result: List[dict] = []
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            result.append({
-                "url": it.get("url") or it.get("link") or it.get("jobUrl"),
-                "title": it.get("title") or it.get("name") or it.get("headline"),
-                "summary": it.get("description") or it.get("snippet"),
-                "author": it.get("author") or it.get("company") or it.get("poster"),
-                "published": it.get("published") or it.get("date") or it.get("postedAt"),
-                "category": None,
-            })
-        return result
+    # LinkedIn news fetching is not currently supported.
+    # The linkedin-scraper MCP only exposes job searches, which is unsuitable
+    # for news. This placeholder is reserved for a future LinkedIn posts/news
+    # integration.

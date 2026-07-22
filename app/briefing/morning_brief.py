@@ -20,7 +20,7 @@ _CLOSING = (
     "Would you like technology news, startup news, world news, "
     "sports news, or AI news?"
 )
-_SOURCES = ["rss", "exa", "youtube", "x", "reddit", "linkedin"]
+_SOURCES = ["rss", "exa", "youtube", "x", "reddit"]
 
 
 def _ordinal(n: int) -> str:
@@ -182,7 +182,7 @@ class MorningBriefing:
         self._processor = processor or NewsProcessor()
         self._summarizer = summarizer or NewsSummarizer()
 
-    async def run(self) -> List[NewsArticle]:
+    async def run(self) -> Tuple[List[NewsArticle], str]:
         ordered = self.ordered_queries or [self.query]
         now = datetime.now()
         greeting = (
@@ -193,6 +193,7 @@ class MorningBriefing:
 
         all_articles: List[NewsArticle] = []
         seen: set = set()
+        spoken: List[str] = []
         for i, q in enumerate(ordered):
             fetcher = self._make_fetcher(q)
             # Greeting is spoken once (first category); later categories just
@@ -204,7 +205,7 @@ class MorningBriefing:
                 # Closing line only after the final category.
                 return [_analyzed_line(count), _CLOSING] if _last else []
 
-            arts, _ = await present_streaming(
+            arts, spoken_text = await present_streaming(
                 fetcher,
                 self._processor,
                 self._summarizer,
@@ -213,8 +214,9 @@ class MorningBriefing:
                 intro,
                 completion,
             )
+            spoken.append(spoken_text)
             for a in arts:
                 if a.id not in seen:
                     seen.add(a.id)
                     all_articles.append(a)
-        return all_articles
+        return all_articles, " ".join(spoken)

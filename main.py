@@ -65,6 +65,8 @@ async def main():
     try:
         await agent.start()
     finally:
+        # Clean up all resources
+        await agent._cleanup()
         # Release the shared RSS aiohttp session so it isn't left open.
         await close_rss_session()
 

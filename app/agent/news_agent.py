@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import random
 import re
+import signal
+import statistics
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -49,6 +51,7 @@ from app.preferences import (
 from app.processors import NewsProcessor
 from app.voice import SpeechRecognizer, VoiceAgent, get_tts_engine
 from app.wakeword import WakeWordDetector, get_wakeword_detector
+from app.wakeword.shared_model import SharedVoskModel, get_shared_model
 
 # category intent -> query used by the fetcher.
 _QUERY_FOR = {
@@ -199,8 +202,14 @@ class NewsAgent:
         self.briefing: Optional[MorningBriefing] = None
         self.conversation = ConversationManager()
         self.preferences_recognizer = PreferenceRecognizer()
-        self.stt = SpeechRecognizer()
-        self.wakeword: WakeWordDetector = get_wakeword_detector()
+
+        # Shared Vosk model manager - loads model once, manages single audio stream
+        self._shared_model = get_shared_model()
+
+        # Pass shared model to wake word detector and STT
+        self.wakeword: WakeWordDetector = get_wakeword_detector(shared_model=self._shared_model)
+        self.stt = SpeechRecognizer(shared_model=self._shared_model)
+
         self._last_articles: List[NewsArticle] = []
         self._last_spoken: str = ""
         # Short-term news memory: within the TTL, repeated commands reuse the
@@ -224,6 +233,18 @@ class NewsAgent:
         # In-session conversation memory (category / articles / selection).
         # Reset on every session boundary so a new wake starts blank.
         self.context = ConversationContext()
+
+        # Performance metrics
+        self._metrics = {
+            "wake_latencies": [],          # ms from wake word to acknowledgment
+            "response_latencies": [],      # ms from wake word to first spoken word
+            "idle_cpu_samples": [],        # CPU % while SLEEPING
+            "idle_memory_samples": [],     # Memory MB while SLEEPING
+            "session_count": 0,
+            "start_time": time.monotonic(),
+        }
+        self._metrics_task: Optional[asyncio.Task] = None
+        self._process = None  # psutil.Process for metrics
 
     def _set_state(self, new: "AgentState") -> None:
         """Transition to ``new`` state, logging only on an actual change."""
@@ -258,6 +279,30 @@ class NewsAgent:
         """
         return NewsSummarizer() if self.preferences.ai_summaries else _NullSummarizer()
 
+    def _install_signal_handlers(self) -> None:
+        """Handle shutdown gracefully on Ctrl+C.
+
+        Note: signal.signal() only works in main thread on Windows.
+        We'll rely on KeyboardInterrupt exception handling instead for Windows.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+
+            def shutdown(signum, frame):
+                print(f"[shutdown] Signal {signum} received, shutting down gracefully...")
+                self._shutdown.set()
+
+            # Only attempt signal handlers on non-Windows platforms where add_signal_handler works
+            if hasattr(signal, 'SIGINT') and hasattr(loop, 'add_signal_handler'):
+                for sig in (signal.SIGINT, signal.SIGTERM):
+                    loop.add_signal_handler(sig, shutdown, None, None)
+            else:
+                # Fallback: rely on KeyboardInterrupt handling in main loop
+                print("[shutdown] Signal handlers not available, relying on exception handling")
+        except Exception:
+            # If signal setup fails, continue without it
+            pass
+
     async def start(self) -> None:
         self.voice = VoiceAgent(get_tts_engine(), top_n=self.top_n)
         self.briefing = MorningBriefing(
@@ -268,19 +313,48 @@ class NewsAgent:
             summarizer=self._build_summarizer(),
         )
 
+        # Install signal handlers
+        self._install_signal_handlers()
+
+        # Start performance metrics background task
+        self._metrics_task = asyncio.create_task(self._metrics_sampler())
+
+        # Start shared model (load Vosk model, open audio stream)
+        try:
+            self._shared_model.start_stream()
+            print("[shared] Vosk model loaded and audio stream started")
+        except Exception as e:
+            print(f"[shared] Failed to start shared model: {e}")
+            raise
+
+        # Start wake word detector (uses shared model)
+        await self.wakeword.start()
+
+        # Initialize process for metrics
+        try:
+            import psutil
+            self._process = psutil.Process()
+        except ImportError:
+            print("[metrics] psutil not available - metrics collection disabled")
+            self._process = None
+
         # 1) Morning Brief at startup (the news pipeline is unchanged).
         self._set_state(AgentState.SPEAKING)
-        self._last_articles = await self.briefing.run()
+        self._last_articles, self._last_spoken = await self.briefing.run()
 
         # 2) Wake-word lifetime, modelled as a clean state machine:
         #    SLEEPING -> (wake) -> LISTENING -> (stop/sleep/timeout) -> SLEEPING.
         #    The microphone only listens for commands while LISTENING; in
         #    SLEEPING it waits solely for the wake word and ignores commands.
-        while True:
+        while not self._shutdown.is_set():
             self._set_state(AgentState.SLEEPING)
             print("[JARVIS] Sleeping - waiting for wake word 'JARVIS'...")
             try:
+                start_time = time.monotonic()
                 await self.wakeword.wait_for_wake()
+                wake_latency = (time.monotonic() - start_time) * 1000  # ms
+                self._metrics["wake_latencies"].append(wake_latency)
+                print(f"[wake] Wake word detected after {wake_latency:.0f}ms")
             except Exception as e:
                 # Mic unavailable / backend error: don't take down the
                 # process. Log and retry after a short pause.
@@ -292,9 +366,14 @@ class NewsAgent:
 
     async def _run_session(self) -> None:
         self._shutdown.clear()
+        # Increment session count at the start of each listening session
+        self._metrics["session_count"] += 1
         self._clear_context()  # defensive: start every session with a blank slate
         self._set_state(AgentState.LISTENING)
         print("[JARVIS] Listening...")
+        # Track response latency from wake word to first spoken response
+        response_start_time = None
+
         last_speech = time.monotonic()
         # One conversation session: listen -> route -> speak -> listen again,
         # until the user says Stop / Sleep or goes quiet for session_timeout.
@@ -329,7 +408,19 @@ class NewsAgent:
                 await self._route_preference(pintent)
                 continue
             intent = await self.conversation.handle(text)
+
+            # If response_start_time is not set (first route call after wake), set it
+            # This will be used to track response latency
+            if response_start_time is None and self.state == AgentState.LISTENING:
+                response_start_time = time.monotonic()
+
             await self._route(intent)
+
+            # If we've responded, record latency and reset for next response
+            if response_start_time is not None and self.state == AgentState.SPEAKING:
+                latency = (time.monotonic() - response_start_time) * 1000  # ms
+                self._metrics["response_latencies"].append(latency)
+                response_start_time = None
 
     # ------------------------------------------------------------------ #
     # wake / sleep lifecycle
@@ -364,6 +455,91 @@ class NewsAgent:
         self._set_state(AgentState.SLEEPING)
         print("[JARVIS] Sleeping - voice commands paused.")
 
+    async def _cleanup(self) -> None:
+        """Graceful shutdown of all components."""
+        print("[cleanup] Starting graceful shutdown...")
+        # Stop wake word detector
+        try:
+            await self.wakeword.stop()
+            print("[cleanup] Wake word detector stopped")
+        except Exception as e:
+            print(f"[cleanup] Error stopping wake word detector: {e}")
+
+        # Stop STT
+        try:
+            await self.stt.stop()
+            print("[cleanup] STT stopped")
+        except Exception as e:
+            print(f"[cleanup] Error stopping STT: {e}")
+
+        # Stop shared model (close audio stream)
+        try:
+            self._shared_model.stop_stream()
+            print("[cleanup] Shared model stream stopped")
+        except Exception as e:
+            print(f"[cleanup] Error stopping shared model: {e}")
+
+        # Cancel metrics task
+        if self._metrics_task and not self._metrics_task.done():
+            self._metrics_task.cancel()
+            try:
+                await self._metrics_task
+            except asyncio.CancelledError:
+                pass
+            print("[cleanup] Metrics task stopped")
+
+        print("[cleanup] Shutdown complete")
+        self._report_metrics()
+
+    async def _metrics_sampler(self) -> None:
+        """Background task sampling idle resources for metrics."""
+        while not self._shutdown.is_set():
+            if self.state == AgentState.SLEEPING:
+                if self._process:
+                    try:
+                        cpu = self._process.cpu_percent()
+                        mem = self._process.memory_info().rss / 1024 / 1024  # MB
+                        self._metrics["idle_cpu_samples"].append(cpu)
+                        self._metrics["idle_memory_samples"].append(mem)
+                    except Exception:
+                        pass
+            await asyncio.sleep(5.0)  # Sample every 5 seconds
+
+    def _report_metrics(self) -> None:
+        """Print collected metrics in a readable format."""
+        m = self._metrics
+        print("=" * 60)
+        print("JARVIS RUNTIME METRICS")
+        print("=" * 60)
+        print(f"Uptime:          {time.monotonic() - m['start_time']:.1f}s")
+        print(f"Sessions:        {m['session_count']}")
+        print(f"Wake cycles:     {len(m['wake_latencies'])}")
+
+        # Track response latencies separately (would need to be collected)
+
+        if m['wake_latencies']:
+            sorted_wakes = sorted(m['wake_latencies'])
+            avg_wake = statistics.mean(sorted_wakes)
+            if len(sorted_wakes) >= 20:
+                p95_idx = int(len(sorted_wakes) * 0.95)
+                p95_wake = sorted_wakes[p95_idx]
+            else:
+                p95_wake = sorted_wakes[-1]
+            max_wake = max(sorted_wakes)
+            print(f"Wake latency:    avg={avg_wake:.0f}ms p95={p95_wake:.0f}ms max={max_wake:.0f}ms")
+
+        if m['idle_cpu_samples']:
+            avg_cpu = statistics.mean(m['idle_cpu_samples'])
+            max_cpu = max(m['idle_cpu_samples'])
+            print(f"Idle CPU:        avg={avg_cpu:.1f}% max={max_cpu:.1f}%")
+
+        if m['idle_memory_samples']:
+            avg_mem = statistics.mean(m['idle_memory_samples'])
+            max_mem = max(m['idle_memory_samples'])
+            print(f"Idle Memory:     avg={avg_mem:.1f}MB max={max_mem:.1f}MB")
+
+        print("=" * 60)
+
     # ------------------------------------------------------------------ #
     # routing
     # ------------------------------------------------------------------ #
@@ -390,7 +566,7 @@ class NewsAgent:
             self.briefing.ordered_queries = self.preferences.briefing_queries(self.query)
             self.briefing.top_n = self.top_n
             self.briefing._summarizer = self._build_summarizer()
-            self._last_articles = await self.briefing.run()
+            self._last_articles, self._last_spoken = await self.briefing.run()
             self._set_context("morning brief", self._last_articles)
             if not self._shutdown.is_set():
                 self._set_state(AgentState.LISTENING)
